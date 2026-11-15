@@ -266,8 +266,8 @@ export async function postRepayment(pool, {
  * 5. Close the loan if nothing is owed any more.
  */
 async function applyRepayment(client, { loanId, amountPaise, date, idempotencyKey, externalEventId, actorId }) {
-  // NOTE: Step 6 adds FOR UPDATE here to make parallel repayments safe.
-  const loan = (await client.query('SELECT * FROM loans WHERE id = $1', [loanId])).rows[0];
+  // Step 6 (D37): FOR UPDATE locks this loan row until COMMIT, so a second repayment waits here.
+  const loan = (await client.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [loanId])).rows[0];
   if (!loan) throw new NotFoundError(`Loan ${loanId} not found`);
   if (loan.status !== 'DISBURSED') throw new ConflictError(`Cannot repay a loan that is ${loan.status}`);
   if (date < loan.disbursed_on) {
