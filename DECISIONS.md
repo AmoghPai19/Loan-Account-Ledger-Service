@@ -267,3 +267,42 @@ beyond the whole loan goes to BORROWER_ADVANCE.**
 - Internal callers (the accrual job, the replay) call services directly as the `system` user.
 - Trade-off: a new entry point must remember to check permissions. With more time: pass the user's role
   into the services and check there too (defence in depth).
+
+## Step 8: Accrual job (interest and penalties)
+
+**D48. Penalty: for each day AFTER the grace period, (overdue principal + interest) x penalty rate / 365.**
+- Summed over all days in exact integers and rounded once, half-up, to the paisa (D2). No penalty on penalty.
+- Grace means grace: an instalment paid within its grace days pays no penalty, and days inside the grace
+  period are never charged, even if payment comes later.
+- Day count is actual/365, because a penalty depends on exactly how many days a payment is late (see D17).
+- Alternatives: a flat late fee; charging from the due date once grace is exceeded; compounding.
+- Verified against an independent day-by-day Python calculation; the code uses a faster segment method.
+
+**D49. The job is idempotent: it computes what the penalty SHOULD be by the run date, and posts only the difference.**
+- Running twice for the same date posts nothing the second time (tested). A missed night needs no special
+  handling: the next run computes "up to today" and catches up.
+- "Already charged" is derived from the ledger (PENALTY_INCOME lines tagged with the instalment), so no
+  extra state table is needed (consistent with D6).
+
+**D50. Out-of-order payments: penalties use each payment's EFFECTIVE date, so late arrivals self-correct.**
+- Example (tested): the job charged 10 days (Rs.60.28); then a payment dated 2026-02-25 arrived. The next run
+  recalculated with the real date (Rs.24.35) and reversed the Rs.35.93 difference.
+- A reversal first reduces penalty still owed; any part already paid is credited to BORROWER_ADVANCE
+  (money owed back to the borrower).
+- With more time: apply borrower advances to the next dues automatically.
+
+**D51. Interest recognised by the job is dated on the instalment's due date, whatever day the job runs.**
+
+**D52. Scheduling: an in-process daily timer (`ACCRUAL_DAILY_AT=01:00`, India time) plus `npm run accrue`.**
+- The CLI command suits cron or Windows Task Scheduler; `--as-of YYYY-MM-DD` re-runs any date.
+- Trade-off: with several API instances, each timer would run the job. That is safe (D49 plus the loan
+  lock) but wasteful. In production I'd run one scheduler (e.g. a cron job) or elect a leader with a
+  Postgres advisory lock.
+
+**D53. One loan per database transaction, with the loan row locked, exactly like repayments (D37, D38).**
+- The job and a repayment on the same loan never interleave; a test runs the job twice in parallel and
+  shows exactly one of them does the work.
+
+**D54. One failing loan does not stop the run.**
+- Its transaction rolls back (nothing half-written), the failure is listed in the run's totals,
+  and the next run retries it.

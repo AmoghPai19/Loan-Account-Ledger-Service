@@ -9,7 +9,8 @@
   "scripts": {
     "test": "node --test --test-concurrency=1",
     "migrate": "node scripts/migrate.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "accrue": "node scripts/run-accruals.js"
   },
   "keywords": [],
   "author": "",
