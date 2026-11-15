@@ -1,0 +1,586 @@
+openapi: 3.0.3
+info:
+  title: Loan Account Ledger Service
+  version: 1.0.0
+  description: |
+    Borrowers, loans, repayment schedules and repayments, recorded in a double-entry ledger.
+
+    **Money** is always a whole number of **paise** (1 rupee = 100 paise) in fields ending in
+    `Paise`, e.g. `amountPaise: 916800` is Rs.9,168.00. Rates are integer basis points
+    (`annualRateBps: 1800` is 18%). Dates are `YYYY-MM-DD` strings.
+
+    **Authentication:** every request except `GET /health` sends an API key in `X-API-Key`.
+    Local development keys: `dev-officer-key`, `dev-manager-key`, `dev-auditor-key`.
+
+    **Roles:** each operation lists the roles allowed. Any other role gets `403 FORBIDDEN`.
+
+    **Request ids:** every response carries `X-Request-Id` (yours, if you sent a sensible one).
+    It is stored on every audit row the request causes.
+servers:
+  - url: http://localhost:3000
+    description: Local development (npm start)
+security:
+  - ApiKey: []
+tags:
+  - name: System
+    description: Health check and the current user.
+  - name: Borrowers
+    description: The people who borrow.
+  - name: Loans
+    description: Products, loans, disbursement and repayment schedules.
+  - name: Repayments
+    description: Idempotent, concurrency-safe repayment posting.
+  - name: Ledger and audit
+    description: Read-only views for managers and auditors.
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      tags: [System]
+      summary: Health check (no API key needed)
+      security: []
+      responses:
+        '200':
+          description: The service and its database are reachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, example: ok }
+
+  /me:
+    get:
+      operationId: getMe
+      tags: [System]
+      summary: Who am I? Returns the user behind the API key.
+      description: 'Roles: OFFICER, MANAGER, AUDITOR.'
+      responses:
+        '200':
+          description: The calling user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /products:
+    get:
+      operationId: listProducts
+      tags: [Loans]
+      summary: List the active loan products
+      description: 'Roles: OFFICER, MANAGER, AUDITOR.'
+      responses:
+        '200':
+          description: The products, ordered by code.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Product' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+
+  /borrowers:
+    post:
+      operationId: createBorrower
+      tags: [Borrowers]
+      summary: Create a borrower
+      description: 'Roles: OFFICER, MANAGER. Writes a BORROWER_CREATED audit row.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BorrowerCreate' }
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Borrower' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /borrowers/{id}:
+    get:
+      operationId: getBorrower
+      tags: [Borrowers]
+      summary: View a borrower
+      description: 'Roles: OFFICER, MANAGER, AUDITOR.'
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: The borrower.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Borrower' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /loans:
+    post:
+      operationId: createLoan
+      tags: [Loans]
+      summary: Create a loan (status CREATED)
+      description: |
+        Roles: OFFICER, MANAGER. The product's terms (rate, penalty rate, grace days, schedule type,
+        frequency) are copied onto the loan. Principal and tenure must be within the product's limits.
+        Writes a LOAN_CREATED audit row.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoanCreate' }
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Loan' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /loans/{id}:
+    get:
+      operationId: getLoan
+      tags: [Loans]
+      summary: View a loan, with balances derived from the ledger
+      description: 'Roles: OFFICER, MANAGER, AUDITOR.'
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: The loan and what the ledger says it owes.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Loan'
+                  - type: object
+                    required: [balances]
+                    properties:
+                      balances: { $ref: '#/components/schemas/LoanBalances' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /loans/{id}/disburse:
+    post:
+      operationId: disburseLoan
+      tags: [Loans]
+      summary: Disburse a loan (manager only, maker-checker)
+      description: |
+        Roles: MANAGER. Builds and stores the repayment schedule, marks the loan DISBURSED and posts
+        Dr PRINCIPAL_RECEIVABLE / Cr BANK. The first instalment is due one period after `disbursedOn`.
+        Writes a LOAN_DISBURSED audit row.
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [disbursedOn]
+              properties:
+                disbursedOn: { type: string, format: date, example: '2026-01-15' }
+      responses:
+        '200':
+          description: Disbursed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [loan, transactionId, instalments]
+                properties:
+                  loan: { $ref: '#/components/schemas/Loan' }
+                  transactionId: { type: string, format: uuid }
+                  instalments: { type: integer, description: Number of instalments in the schedule, example: 12 }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /loans/{id}/schedule:
+    get:
+      operationId: getSchedule
+      tags: [Loans]
+      summary: View the repayment schedule, with what has been paid on each instalment
+      description: |
+        Roles: OFFICER, MANAGER, AUDITOR. Supports flat-rate and reducing-balance (EMI) schedules,
+        weekly or monthly. "Paid" amounts are derived from ledger entries, never stored.
+      parameters:
+        - $ref: '#/components/parameters/Id'
+      responses:
+        '200':
+          description: The schedule.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Schedule' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /loans/{id}/repayments:
+    post:
+      operationId: postRepayment
+      tags: [Repayments]
+      summary: Post a repayment (idempotent)
+      description: |
+        Roles: OFFICER, MANAGER.
+
+        **Idempotency:** send a unique `Idempotency-Key` per intended payment and reuse it on retries.
+        A repeat with the same key and the same body returns the ORIGINAL status and body with
+        `"replayed": true` and header `Idempotent-Replayed: true`, and posts nothing. The same key with
+        a different body returns 422. A request that fails does not use up its key.
+
+        **Allocation:** all outstanding penalties first (oldest instalment first), then instalment by
+        instalment: interest, then principal. Money beyond the whole loan goes to BORROWER_ADVANCE.
+        Interest not yet recognised is recognised first, in the same database transaction.
+
+        **Concurrency:** repayments on the same loan are serialised by a row lock; payments on different
+        loans run in parallel. Writes REPAYMENT_POSTED (and LOAN_CLOSED, if it closes the loan) audit rows.
+      parameters:
+        - $ref: '#/components/parameters/Id'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: 1-200 printable characters, no spaces. Unique per intended payment.
+          schema: { type: string, minLength: 1, maxLength: 200, example: UPI-20260215-0001 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RepaymentRequest' }
+      responses:
+        '201':
+          description: Posted, or a replay of the original response (see `replayed`).
+          headers:
+            Idempotent-Replayed:
+              description: '"true" when this is a stored response to a repeated request.'
+              schema: { type: string, enum: ['true', 'false'] }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RepaymentResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422':
+          description: The Idempotency-Key was already used for a different request (or by another user).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /ledger/trial-balance:
+    get:
+      operationId: getTrialBalance
+      tags: [Ledger and audit]
+      summary: Total debits and credits across the whole ledger
+      description: 'Roles: MANAGER, AUDITOR.'
+      responses:
+        '200':
+          description: The trial balance.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TrialBalance' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /audit:
+    get:
+      operationId: listAudit
+      tags: [Ledger and audit]
+      summary: The audit trail, newest first
+      description: |
+        Roles: MANAGER, AUDITOR. Every change (borrower created, loan created / disbursed / closed,
+        repayment posted, accruals posted) has one row, written in the same database transaction as the
+        change. Rows can never be edited or deleted.
+      parameters:
+        - name: entityType
+          in: query
+          schema: { type: string, enum: [loan, borrower] }
+        - name: entityId
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        '200':
+          description: Audit rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AuditEntry' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+components:
+  securitySchemes:
+    ApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  parameters:
+    Id:
+      name: id
+      in: path
+      required: true
+      description: A UUID. Anything that is not a UUID returns 404.
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: Invalid input (VALIDATION_ERROR) or malformed JSON (INVALID_JSON).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthenticated:
+      description: Missing or unknown X-API-Key (UNAUTHENTICATED).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: The caller's role may not do this (FORBIDDEN).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: No such resource (NOT_FOUND).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Valid request that clashes with the current state, e.g. disbursing twice or repaying a closed loan (CONFLICT).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Paise:
+      type: integer
+      description: Whole paise (1 rupee = 100 paise).
+      example: 916800
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum: [VALIDATION_ERROR, INVALID_JSON, UNAUTHENTICATED, FORBIDDEN, NOT_FOUND, CONFLICT, IDEMPOTENCY_KEY_REUSED, INTERNAL_ERROR]
+            message: { type: string }
+            details: {}
+
+    Me:
+      type: object
+      required: [id, username, role]
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string, example: officer.asha }
+        role: { $ref: '#/components/schemas/Role' }
+
+    Role:
+      type: string
+      enum: [OFFICER, MANAGER, AUDITOR]
+
+    Product:
+      type: object
+      required: [id, code, name, scheduleType, frequency, annualRateBps, penaltyRateBps, graceDays,
+                 minPrincipalPaise, maxPrincipalPaise, minTenure, maxTenure, active]
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, enum: [WGL, EMI, FLT] }
+        name: { type: string, example: Monthly EMI Loan }
+        scheduleType: { type: string, enum: [FLAT, REDUCING] }
+        frequency: { type: string, enum: [WEEKLY, MONTHLY] }
+        annualRateBps: { type: integer, example: 1800 }
+        penaltyRateBps: { type: integer, example: 2400 }
+        graceDays: { type: integer, example: 5 }
+        minPrincipalPaise: { $ref: '#/components/schemas/Paise' }
+        maxPrincipalPaise: { $ref: '#/components/schemas/Paise' }
+        minTenure: { type: integer }
+        maxTenure: { type: integer }
+        active: { type: boolean }
+
+    BorrowerCreate:
+      type: object
+      required: [externalRef, fullName]
+      properties:
+        externalRef: { type: string, description: 'Unique reference, e.g. a customer number', example: CUST-0001 }
+        fullName: { type: string, example: Priya Sharma }
+        phone: { type: string, nullable: true }
+
+    Borrower:
+      type: object
+      required: [id, externalRef, fullName, phone, createdBy, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        externalRef: { type: string }
+        fullName: { type: string }
+        phone: { type: string, nullable: true }
+        createdBy: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+
+    LoanCreate:
+      type: object
+      required: [borrowerId, productCode, principalPaise, tenure]
+      properties:
+        borrowerId: { type: string, format: uuid }
+        productCode: { type: string, enum: [WGL, EMI, FLT] }
+        principalPaise: { $ref: '#/components/schemas/Paise' }
+        tenure: { type: integer, description: Number of instalments, example: 12 }
+
+    Loan:
+      type: object
+      required: [id, borrowerId, productId, principalPaise, scheduleType, frequency, annualRateBps,
+                 penaltyRateBps, graceDays, tenure, status, disbursedOn, firstDueDate, closedOn, createdBy, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        borrowerId: { type: string, format: uuid }
+        productId: { type: string, format: uuid }
+        principalPaise: { $ref: '#/components/schemas/Paise' }
+        scheduleType: { type: string, enum: [FLAT, REDUCING] }
+        frequency: { type: string, enum: [WEEKLY, MONTHLY] }
+        annualRateBps: { type: integer }
+        penaltyRateBps: { type: integer }
+        graceDays: { type: integer }
+        tenure: { type: integer }
+        status: { type: string, enum: [CREATED, DISBURSED, CLOSED] }
+        disbursedOn: { type: string, format: date, nullable: true }
+        firstDueDate: { type: string, format: date, nullable: true }
+        closedOn: { type: string, format: date, nullable: true }
+        createdBy: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time }
+
+    LoanBalances:
+      type: object
+      description: Derived from ledger entries (assets are debit-normal, shown as positive amounts owed).
+      required: [principalReceivablePaise, interestReceivablePaise, penaltyReceivablePaise, totalReceivablePaise]
+      properties:
+        principalReceivablePaise: { $ref: '#/components/schemas/Paise' }
+        interestReceivablePaise: { $ref: '#/components/schemas/Paise' }
+        penaltyReceivablePaise: { $ref: '#/components/schemas/Paise' }
+        totalReceivablePaise: { $ref: '#/components/schemas/Paise' }
+
+    Instalment:
+      type: object
+      required: [instalmentId, instalmentNo, dueDate, principalDuePaise, interestDuePaise, principalPaidPaise,
+                 interestAccruedPaise, interestPaidPaise, penaltyAccruedPaise, penaltyPaidPaise,
+                 principalOutstandingPaise, interestOutstandingPaise, penaltyOutstandingPaise, status]
+      properties:
+        instalmentId: { type: string, format: uuid }
+        instalmentNo: { type: integer }
+        dueDate: { type: string, format: date }
+        principalDuePaise: { $ref: '#/components/schemas/Paise' }
+        interestDuePaise: { $ref: '#/components/schemas/Paise' }
+        principalPaidPaise: { $ref: '#/components/schemas/Paise' }
+        interestAccruedPaise: { $ref: '#/components/schemas/Paise' }
+        interestPaidPaise: { $ref: '#/components/schemas/Paise' }
+        penaltyAccruedPaise: { $ref: '#/components/schemas/Paise' }
+        penaltyPaidPaise: { $ref: '#/components/schemas/Paise' }
+        principalOutstandingPaise: { $ref: '#/components/schemas/Paise' }
+        interestOutstandingPaise: { $ref: '#/components/schemas/Paise' }
+        penaltyOutstandingPaise: { $ref: '#/components/schemas/Paise' }
+        status: { type: string, enum: [UNPAID, PARTIALLY_PAID, PAID] }
+
+    Schedule:
+      type: object
+      required: [loanId, status, scheduleType, frequency, instalments, totals]
+      properties:
+        loanId: { type: string, format: uuid }
+        status: { type: string, enum: [CREATED, DISBURSED, CLOSED] }
+        scheduleType: { type: string, enum: [FLAT, REDUCING] }
+        frequency: { type: string, enum: [WEEKLY, MONTHLY] }
+        instalments:
+          type: array
+          items: { $ref: '#/components/schemas/Instalment' }
+        totals:
+          type: object
+          required: [principalDuePaise, interestDuePaise, principalPaidPaise, interestPaidPaise, penaltyPaidPaise, outstandingPaise]
+          properties:
+            principalDuePaise: { $ref: '#/components/schemas/Paise' }
+            interestDuePaise: { $ref: '#/components/schemas/Paise' }
+            principalPaidPaise: { $ref: '#/components/schemas/Paise' }
+            interestPaidPaise: { $ref: '#/components/schemas/Paise' }
+            penaltyPaidPaise: { $ref: '#/components/schemas/Paise' }
+            outstandingPaise: { $ref: '#/components/schemas/Paise' }
+
+    RepaymentRequest:
+      type: object
+      required: [amountPaise, effectiveDate]
+      properties:
+        amountPaise: { $ref: '#/components/schemas/Paise' }
+        effectiveDate:
+          type: string
+          format: date
+          description: The day the money was actually paid. May be earlier than today (late-arriving payments).
+          example: '2026-02-15'
+        externalEventId:
+          type: string
+          nullable: true
+          description: The payment's reference in the upstream system, e.g. a UPI transaction id.
+
+    AllocationLine:
+      type: object
+      required: [instalmentId, instalmentNo, component, amountPaise]
+      properties:
+        instalmentId: { type: string, format: uuid }
+        instalmentNo: { type: integer }
+        component: { type: string, enum: [PENALTY, INTEREST, PRINCIPAL] }
+        amountPaise: { $ref: '#/components/schemas/Paise' }
+
+    RepaymentResult:
+      type: object
+      required: [transactionId, loanId, amountPaise, effectiveDate, allocation, advancePaise, loanStatus, balances, replayed]
+      properties:
+        transactionId: { type: string, format: uuid }
+        loanId: { type: string, format: uuid }
+        amountPaise: { $ref: '#/components/schemas/Paise' }
+        effectiveDate: { type: string, format: date }
+        allocation:
+          type: array
+          items: { $ref: '#/components/schemas/AllocationLine' }
+        advancePaise:
+          allOf: [{ $ref: '#/components/schemas/Paise' }]
+          description: Money beyond everything owed, held for the borrower (BORROWER_ADVANCE).
+        loanStatus: { type: string, enum: [DISBURSED, CLOSED] }
+        balances: { $ref: '#/components/schemas/LoanBalances' }
+        replayed: { type: boolean, description: true when this is the stored response to a repeated request }
+
+    TrialBalance:
+      type: object
+      required: [debitsPaise, creditsPaise, balanced]
+      properties:
+        debitsPaise: { $ref: '#/components/schemas/Paise' }
+        creditsPaise: { $ref: '#/components/schemas/Paise' }
+        balanced: { type: boolean }
+
+    AuditEntry:
+      type: object
+      required: [id, at, action, entityType, entityId, before, after, requestId, actorUsername, actorRole]
+      properties:
+        id: { type: integer }
+        at: { type: string, format: date-time }
+        action:
+          type: string
+          enum: [BORROWER_CREATED, LOAN_CREATED, LOAN_DISBURSED, REPAYMENT_POSTED, LOAN_CLOSED, ACCRUALS_POSTED]
+        entityType: { type: string, enum: [loan, borrower] }
+        entityId: { type: string }
+        before: { type: object, nullable: true }
+        after: { type: object, nullable: true }
+        requestId: { type: string, nullable: true }
+        actorUsername: { type: string }
+        actorRole: { type: string, enum: [OFFICER, MANAGER, AUDITOR] }
