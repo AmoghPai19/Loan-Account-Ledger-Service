@@ -82,3 +82,31 @@ Each entry: **what** was decided, the **alternatives**, and **why**. The write-u
 **D15. The Docker database is exposed on host port 5433, not the default 5432.**
 - Why: a locally installed PostgreSQL already used 5432. Mapping 5433->5432 avoids the clash
   without changing the container itself. All connection settings come from `.env`.
+
+## Step 2: Schedule engine
+
+**D16. Due dates are anchored to the first due date, with month-end clamping.**
+- Instalment k is due `first due date + k periods`, never `previous due date + 1 period`.
+- Alternative: chaining from the previous instalment. It drifts: 31 Jan -> 28 Feb -> 28 Mar -> 28 Apr ...
+  Anchoring gives 31 Jan -> 28 Feb -> 31 Mar -> 30 Apr, which is what the contract means.
+- The first instalment is due one period after disbursement (7 days, or 1 calendar month).
+
+**D17. Periodic rate = annual rate / periods per year (12 or 52), not actual days / 365.**
+- Alternative: day-count conventions (actual/365), where each period's interest depends on its exact length.
+- Why: this is the standard EMI convention, every instalment is predictable, and results match the
+  spreadsheet PMT function, so anyone can verify them. Day-count precision is used for penalties
+  (Step 8), where amounts depend on exactly how many days a payment is late.
+
+**D18. Reducing-balance: EMI is rounded half-up to the paisa; the last instalment repays exactly the
+remaining principal.**
+- Consequence: the final instalment may differ from the EMI by a few paise (Rs.9,167.99 instead of
+  Rs.9,168.00 in the test example). This is visible and explainable, and the loan always closes at exactly 0.
+- Alternative: rounding the EMI up to the whole rupee (common in practice), which leaves a larger final
+  adjustment. Rounding to the paisa keeps the maths closest to the formula.
+
+**D19. The schedule engine is pure functions (no database, no clock).**
+- Why: it can be tested in isolation against hand-calculated values. A property test checks 600 loan
+  combinations for the rules that must always hold: principal sums exactly, no negative amounts,
+  the balance ends at zero, and due dates increase.
+- Expected test values were computed independently (Python Decimal, cross-checked with PMT) rather than
+  copied from the code's own output.
