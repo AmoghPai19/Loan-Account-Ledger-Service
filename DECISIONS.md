@@ -110,3 +110,36 @@ remaining principal.**
   the balance ends at zero, and due dates increase.
 - Expected test values were computed independently (Python Decimal, cross-checked with PMT) rather than
   copied from the code's own output.
+
+## Step 3: Ledger posting service
+
+**D20. Repayment allocation order: all penalties first (oldest instalment first), then instalment by
+instalment, oldest first: interest, then principal.**
+- Alternative: component-first across all instalments (all interest everywhere, then all principal).
+- Why: clears the costliest and oldest dues first, which is standard lending practice, and an instalment is
+  fully settled before money moves to the next. It is a pure function (`allocateRepayment`) with its own unit tests.
+
+**D21. Interest becomes receivable when its instalment falls due (accrual job, Step 8), OR earlier when a
+repayment reaches it, whichever happens first.**
+- How: before crediting interest that hasn't been accrued yet, the repayment posts that instalment's full
+  interest as an INTEREST_ACCRUAL (Dr INTEREST_RECEIVABLE / Cr INTEREST_INCOME), in the same database transaction.
+- Why: the Interest Receivable account can never go negative (you can't collect what was never owed),
+  and the accrual job won't recognise the same interest twice, because "already accrued" is derived from the ledger.
+
+**D22. Money beyond what is currently due pays future instalments in order (schedule unchanged); only money
+beyond the whole loan goes to BORROWER_ADVANCE.**
+- Alternative: treat excess as a principal prepayment and recalculate the schedule (lower future interest).
+- Why: simple and common in microfinance ("paying instalments in advance"). Trade-off: a borrower who
+  pre-pays still pays the scheduled interest; prepayment rebates / rescheduling are a "with more time" item.
+
+**D23. Every write is one database transaction, and the posting code checks balance before writing.**
+- `withTransaction` wraps each operation: a repayment's accrual, entries and loan-status change all commit
+  together or not at all. `assertBalanced` gives a clear error early; the database trigger (D7) remains the
+  final guarantee. A test confirms that rejected requests leave nothing behind in the ledger.
+
+**D24. The service layer throws typed errors (ValidationError 400, NotFoundError 404, ConflictError 409).**
+- Why: business rules stay independent of HTTP. Step 4 maps each type to a status code in one place.
+
+**D25. Disbursement locks the loan row (`SELECT ... FOR UPDATE`) before checking its status.**
+- Why: two simultaneous disburse requests could otherwise both see CREATED and both disburse.
+  The same protection for repayments is deliberately left to Step 6, where a parallel test proves it is needed.
