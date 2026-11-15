@@ -199,3 +199,35 @@ beyond the whole loan goes to BORROWER_ADVANCE.**
 
 **D36. Keys are kept indefinitely.**
 - Fine at this scale. With more time: expire keys after e.g. 30 days with a scheduled cleanup, as payment APIs do.
+
+## Step 6: Concurrency
+
+**D37. Every repayment locks its loan row (`SELECT ... FOR UPDATE`) before reading what is owed.**
+- A second repayment on the same loan waits at that line until the first commits. Under Postgres's default
+  READ COMMITTED isolation, each later statement sees newly committed data, so the waiting repayment then
+  reads the position AFTER the first payment and allocates correctly.
+- Why the loan row: the loan is the unit that must stay consistent. Payments on DIFFERENT loans lock
+  different rows and never wait for each other.
+- Alternatives: SERIALIZABLE isolation (correct, but every conflict aborts a transaction that must be retried);
+  optimistic locking with a version column (also needs retries); a per-loan queue (more infrastructure).
+  A row lock is the simplest correct option for short transactions like these.
+
+**D38. No deadlocks by design: a repayment takes its idempotency key, then exactly ONE loan lock.**
+- A transaction never locks two loans, so two transactions can't each hold a lock the other needs.
+  The accrual job (Step 8) follows the same rule: one loan per transaction.
+
+**D39. The concurrency test compares parallel results with the sequential result.**
+- Allocation is a waterfall (D20), so N payments posted one after another end exactly where ONE payment of
+  their total would. `allocateRepayment(total)` therefore gives the expected position of every instalment.
+- Shown failing WITHOUT the lock:
+  - 10 parallel EMIs: instalment 1's interest was paid Rs.15,000 against Rs.1,500 due (all ten payments
+    read "instalment 1 unpaid" and paid it).
+  - 25 parallel payments of different amounts: Rs.24,772.11 of interest credited to instalment 1 against Rs.1,500 due.
+  - 15 parallel EMIs (Rs.1,37,520 against Rs.1,10,015.99 owed): the loan never closed.
+  - Throughout, the trial balance still balanced: every corrupted transaction had debits = credits.
+    "The ledger balances" alone does not prove the money landed in the right place.
+- Passing WITH the lock, on every run, for all three scenarios.
+
+**D40. Status checks happen under the lock.**
+- When parallel payments overpay a loan, exactly one of them closes it; the rest see CLOSED and are refused
+  with 409, posting nothing. Accepted money minus the borrower advance equals exactly what was owed.
