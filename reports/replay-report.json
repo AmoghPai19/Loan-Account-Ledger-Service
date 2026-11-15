@@ -1,0 +1,73 @@
+{
+  "dataset": {
+    "seed": 20260101,
+    "borrowers": 220,
+    "loans": 261,
+    "loansByProduct": {
+      "WGL": 130,
+      "EMI": 68,
+      "FLT": 63
+    },
+    "totalEvents": 5000,
+    "uniqueEvents": 4700,
+    "duplicateDeliveries": 300,
+    "deliberatelyDelayed": 396,
+    "firstPaymentDate": "2026-01-11",
+    "lastPaymentDate": "2026-09-10"
+  },
+  "events": {
+    "total": 5000,
+    "uniqueEventIds": 4700,
+    "inOrder": 4433,
+    "outOfOrder": 267,
+    "duplicates": 300
+  },
+  "outcomes": {
+    "posted": 4700,
+    "extraDeliveries": 300,
+    "extraDeliveriesAnsweredWithoutPosting": 300,
+    "answeredFromStoredResult": 300,
+    "eventsPostedTwiceInReplay": 0,
+    "outOfOrderPosted": 267,
+    "eventsRefusedLoanAlreadyClosed": 0,
+    "failed": 0
+  },
+  "checks": {
+    "trialBalanceBalances": true,
+    "unbalancedTransactions": 0,
+    "accountsNetToZero": true,
+    "eventsPostedMoreThanOnce": 0,
+    "repaymentTransactions": 4700,
+    "bankReceivedPaise": 1394128637,
+    "instalmentsOverpaidOrOveraccrued": 0,
+    "negativeReceivables": 0,
+    "repaymentsMatchPostedEvents": true,
+    "bankMatchesPostedAmounts": true
+  },
+  "ledger": {
+    "debitsPaise": 4179269705,
+    "creditsPaise": 4179269705,
+    "disbursedPaise": 2566000000,
+    "repaymentsReceivedPaise": 1394128637,
+    "principalOutstandingPaise": 1370312106,
+    "interestReceivablePaise": 19045161,
+    "penaltyReceivablePaise": 1279666,
+    "interestIncomePaise": 215085929,
+    "penaltyIncomePaise": 3304143,
+    "borrowerAdvancePaise": 375498,
+    "loans": {
+      "disbursed": 259,
+      "closed": 2
+    }
+  },
+  "accruals": {
+    "runs": 39,
+    "interestAccruedPaise": 62050182,
+    "penaltyChargedPaise": 3679641,
+    "penaltyReversedPaise": 375498,
+    "failures": 0
+  },
+  "finishedSimulatedDay": "2026-10-04",
+  "seconds": 3637,
+  "pass": true
+}

@@ -306,3 +306,50 @@ beyond the whole loan goes to BORROWER_ADVANCE.**
 **D54. One failing loan does not stop the run.**
 - Its transaction rolls back (nothing half-written), the failure is listed in the run's totals,
   and the next run retries it.
+
+## Step 9: Synthetic data and the 5,000-event replay
+
+**D55. The generator is seeded (mulberry32), so the same seed always produces the same dataset.**
+- `npm run generate` (seed 20260101) gives 220 borrowers, 261 loans (130 weekly group, 68 EMI, 63 flat-rate)
+  and exactly 5,000 events. A test checks that generating twice gives identical data.
+
+**D56. Borrowers behave realistically, and all personal data is invented.**
+- Per instalment: 70% pay on time, 12% pay 3-25 days late, 6% split the payment in two, 4% miss it and
+  catch up with the next one, 4% round up to the next Rs.100, 4% pay a few days early.
+- Names are random combinations from short lists; phone numbers use the prefix +91-00000-, which is not a real number range.
+
+**D57. Two delivery problems are added on purpose.**
+- 300 duplicate deliveries of existing event ids: 40% arrive seconds later (a quick gateway retry),
+  60% minutes to 3 days later (a webhook redelivered).
+- 8% of payments are delayed 3-30 days in transit, so they arrive after later payments by the same borrower.
+
+**D58. Each event's id is used as its Idempotency-Key and stored as external_event_id.**
+- Duplicates are therefore caught by exactly the same mechanism as API retries (Step 5): no special replay logic.
+
+**D59. The replay feeds events in ARRIVAL order on a simulated clock, with the accrual job every 7 simulated days.**
+- Payments post at their real (effective) dates. Because the job computes "what is owed by today" (D49),
+  running it weekly instead of nightly keeps the replay to about 1.5 minutes.
+- Each replay uses a fresh `ledger_replay` database, so development data is never touched.
+
+**D60. Different loans are processed in parallel (8 at a time); each loan's own events go one by one, in arrival order.**
+- Found while building it: processing same-loan, same-day payments in parallel let the lock pick either one
+  first. Both orders are correct, but they split money between penalty and principal differently, so penalty
+  income varied by a few paise between runs. One-by-one per loan makes the report identical on every run.
+  Safety under same-loan races is already proven by the Step 5 and Step 6 tests.
+
+**D61. How events are classified and counted.**
+- Duplicate: an event id that has already arrived. Out-of-order: a first arrival whose payment date is earlier
+  than a payment for the same loan that already arrived.
+- Duplicates are counted PER EVENT ID: each id must post at most once, and every extra copy must be answered
+  without posting. Found while building it: my first report counted "was the LATER copy replayed?", which
+  failed 25 times because copies arriving seconds apart raced and either copy could win. The ledger was
+  correct; the report was asking the wrong question.
+
+**D62. Replay results (seed 20260101): PASS.**
+- 5,000 events: 4,700 posted (one per unique event id), 300 duplicates answered without posting, 0 posted twice,
+  267 out-of-order arrivals all posted at their real dates, 0 failures.
+- Trial balance balances (Rs.4,17,92,697.05 on each side); every transaction balances; all accounts net to zero;
+  money into the bank equals the sum of posted events exactly; no instalment overpaid; no negative receivables.
+- Late-arriving payments triggered Rs.3,754.98 of penalty reversals. All of it had already been paid, so it
+  now sits in BORROWER_ADVANCE (owed back to borrowers), which matches D50 exactly.
+- Only 2 of 261 loans closed: the payment data runs to September, while most loans run longer.

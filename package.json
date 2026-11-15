@@ -10,7 +10,9 @@
     "test": "node --test --test-concurrency=1",
     "migrate": "node scripts/migrate.js",
     "start": "node src/server.js",
-    "accrue": "node scripts/run-accruals.js"
+    "accrue": "node scripts/run-accruals.js",
+    "generate": "node scripts/generate-data.js",
+    "replay": "node scripts/replay.js"
   },
   "keywords": [],
   "author": "",
