@@ -168,3 +168,34 @@ beyond the whole loan goes to BORROWER_ADVANCE.**
 
 **D30. The database uses snake_case; the API uses camelCase, converted at the edge (`toCamel`).**
 - Why: each side follows its own convention, and the conversion happens in one place.
+
+## Step 5: Idempotency
+
+**D31. Every repayment request must carry a client-generated `Idempotency-Key` header, reused on retries.**
+- A repeat with the same key returns the original status and body, marked `"replayed": true` and with an
+  `Idempotent-Replayed: true` header, and posts nothing.
+- Alternative: the server detects duplicates itself (same loan, amount and date within a time window).
+- Why not: two genuine, identical payments (e.g. two EMIs of the same amount on the same day) would be
+  wrongly merged. Only the client knows whether a request is a retry or a new payment.
+
+**D32. The key is claimed inside the SAME database transaction as the ledger posting.**
+- Claim (INSERT into `idempotency_records`), post the entries, store the response: one COMMIT.
+- Consequences: there is never a saved key without its posting, or a posting without its key. A request that
+  fails (bad date, closed loan) rolls the key back too, so the client can fix the request and retry.
+- Alternative: a separate store (e.g. Redis) with an IN_PROGRESS state, which then needs timeouts and recovery
+  for requests that crashed halfway.
+
+**D33. Duplicates that arrive at the same moment are serialised by Postgres itself.**
+- `INSERT ... ON CONFLICT (key) DO NOTHING`: a second INSERT of a key that another open transaction has just
+  inserted WAITS for that transaction to finish, then sees the key and replays. No extra locks are needed.
+- Proven by a test that fires 5 identical requests in parallel: exactly one posts (run 10 times, passing every time).
+- Last safety net: `ledger_transactions.idempotency_key` is also UNIQUE.
+
+**D34. The same key with a different request (or from a different user) is rejected with 422.**
+- A SHA-256 fingerprint of (loan, amount, effective date, external event id) is stored with the key.
+- Why: reusing a key for a different payment is a client bug; silently returning the old response would hide it.
+
+**D35. The service accepts requests without a key (trusted internal callers); the HTTP API always requires one.**
+
+**D36. Keys are kept indefinitely.**
+- Fine at this scale. With more time: expire keys after e.g. 30 days with a scheduled cleanup, as payment APIs do.

@@ -10,15 +10,15 @@ describe('REST API', () => {
   let base;
 
   /** Small fetch wrapper: JSON in, { status, body } out. */
-  async function call(method, path, { body, key = 'dev-officer-key', raw } = {}) {
-    const headers = { 'Content-Type': 'application/json' };
+  async function call(method, path, { body, key = 'dev-officer-key', raw, headers: extra = {} } = {}) {
+    const headers = { 'Content-Type': 'application/json', ...extra };
     if (key) headers['X-API-Key'] = key;
     const res = await fetch(base + path, {
       method,
       headers,
       body: raw ?? (body === undefined ? undefined : JSON.stringify(body)),
     });
-    return { status: res.status, body: await res.json() };
+    return { status: res.status, headers: res.headers, body: await res.json() };
   }
 
   before(async () => {
@@ -79,11 +79,20 @@ describe('REST API', () => {
     assert.equal(s.body.instalments[0].dueDate, '2026-02-01');
 
     // repay the first instalment: Rs.100 interest + Rs.833.33 principal
-    const p = await call('POST', `/loans/${loanId}/repayments`, {
+    const repay = () => call('POST', `/loans/${loanId}/repayments`, {
       body: { amountPaise: 93_333, effectiveDate: '2026-02-01', externalEventId: 'UPI-0001' },
+      headers: { 'Idempotency-Key': 'api-test-repay-1' },
     });
+    const p = await repay();
     assert.equal(p.status, 201);
+    assert.equal(p.headers.get('Idempotent-Replayed'), 'false');
     assert.deepEqual(p.body.allocation.map((a) => [a.component, a.amountPaise]), [['INTEREST', 10_000], ['PRINCIPAL', 83_333]]);
+
+    // Step 5: the same request again (a client retry) is replayed, not posted twice.
+    const again = await repay();
+    assert.equal(again.status, 201);
+    assert.equal(again.headers.get('Idempotent-Replayed'), 'true');
+    assert.equal(again.body.transactionId, p.body.transactionId);
 
     // loan view shows ledger-derived balances
     const g = await call('GET', `/loans/${loanId}`);
@@ -112,6 +121,14 @@ describe('REST API', () => {
     assert.equal((await call('GET', '/loans/00000000-0000-0000-0000-000000000000')).status, 404);
     assert.equal((await call('GET', '/loans/not-a-uuid')).status, 404);
     assert.equal((await call('GET', '/nothing-here')).status, 404);
+  });
+
+  it('requires an Idempotency-Key on repayments (400 without one)', async () => {
+    const r = await call('POST', '/loans/00000000-0000-0000-0000-000000000000/repayments', {
+      body: { amountPaise: 100, effectiveDate: '2026-02-01' },
+    });
+    assert.equal(r.status, 400);
+    assert.match(r.body.error.message, /Idempotency-Key/);
   });
 
   it('returns 409 for a conflict (duplicate borrower)', async () => {

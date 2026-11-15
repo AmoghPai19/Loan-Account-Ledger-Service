@@ -8,7 +8,7 @@
 // =====================================================================
 import express from 'express';
 import { authenticate } from './http/auth.js';
-import { AppError, NotFoundError } from './errors.js';
+import { AppError, NotFoundError, ValidationError } from './errors.js';
 import {
   createBorrower, createLoan, getLoan, disburseLoan, getSchedule, postRepayment,
 } from './services/loans.js';
@@ -111,11 +111,19 @@ export function createApp({ pool }) {
     });
   });
 
+  // Step 5 (D31): every repayment must carry an Idempotency-Key header.
+  // A repeat with the same key returns the original response (same status,
+  // same body, replayed: true) and posts nothing.
   app.post('/loans/:id/repayments', async (req, res) => {
     const id = requireUuid(req.params.id, 'Loan');
+    const idempotencyKey = req.get('Idempotency-Key');
+    if (!idempotencyKey) {
+      throw new ValidationError('Send an Idempotency-Key header (a unique value per payment, reused on retries)');
+    }
     const { amountPaise, effectiveDate, externalEventId } = req.body ?? {};
-    const result = await postRepayment(pool, { loanId: id, amountPaise, effectiveDate, externalEventId }, req.user.id);
-    res.status(201).json(result);
+    const result = await postRepayment(
+      pool, { loanId: id, amountPaise, effectiveDate, externalEventId, idempotencyKey }, req.user.id);
+    res.status(201).set('Idempotent-Replayed', String(result.replayed)).json(result);
   });
 
   // ----- ledger -----

@@ -11,6 +11,7 @@ import { ValidationError, NotFoundError, ConflictError } from '../errors.js';
 import { assertIsoDate } from '../domain/dates.js';
 import { buildSchedule, firstDueDateFor } from '../domain/schedule.js';
 import { allocateRepayment } from '../domain/allocation.js';
+import { requireIdempotencyKey, requestHash, claimKey, completeKey } from './idempotency.js';
 import {
   LOAN_ACCOUNTS, COMPANY_ACCOUNTS, createLoanAccounts, accountIds,
   postTransaction, loanLedgerBalances,
@@ -217,7 +218,44 @@ export async function getSchedule(db, loanId) {
 }
 
 /**
- * Post a repayment.
+ * Post a repayment, at most once per Idempotency-Key (Step 5).
+ *
+ * With a key: the key is claimed first, inside the same database
+ * transaction as the posting. A repeat of the same request returns the
+ * stored response with replayed: true and posts nothing.
+ * Without a key (trusted internal callers only; the API always requires
+ * one): the repayment is simply posted.
+ */
+export async function postRepayment(pool, {
+  loanId, amountPaise, effectiveDate, idempotencyKey = null, externalEventId = null,
+}, actorId) {
+  requirePositivePaise(amountPaise, 'amountPaise');
+  const date = requireDate(effectiveDate, 'effectiveDate');
+  if (idempotencyKey !== null) requireIdempotencyKey(idempotencyKey);
+
+  return withTransaction(pool, async (client) => {
+    if (idempotencyKey !== null) {
+      const claim = await claimKey(client, {
+        key: idempotencyKey,
+        userId: actorId,
+        hash: requestHash(['repayment', loanId, amountPaise, date, externalEventId ?? null]),
+      });
+      if (!claim.claimed) return { ...claim.responseBody, replayed: true };
+    }
+
+    const result = await applyRepayment(client, {
+      loanId, amountPaise, date, idempotencyKey, externalEventId, actorId,
+    });
+
+    if (idempotencyKey !== null) {
+      await completeKey(client, { key: idempotencyKey, responseCode: 201, responseBody: result });
+    }
+    return { ...result, replayed: false };
+  });
+}
+
+/**
+ * The repayment itself, inside the caller's database transaction.
  *
  * 1. Work out what is owed per instalment (from the ledger).
  * 2. Split the money (allocateRepayment, D20).
@@ -227,113 +265,107 @@ export async function getSchedule(db, loanId) {
  *    Cr BORROWER_ADVANCE for anything left over.
  * 5. Close the loan if nothing is owed any more.
  */
-export async function postRepayment(pool, {
-  loanId, amountPaise, effectiveDate, idempotencyKey = null, externalEventId = null,
-}, actorId) {
-  requirePositivePaise(amountPaise, 'amountPaise');
-  const date = requireDate(effectiveDate, 'effectiveDate');
+async function applyRepayment(client, { loanId, amountPaise, date, idempotencyKey, externalEventId, actorId }) {
+  // NOTE: Step 6 adds FOR UPDATE here to make parallel repayments safe.
+  const loan = (await client.query('SELECT * FROM loans WHERE id = $1', [loanId])).rows[0];
+  if (!loan) throw new NotFoundError(`Loan ${loanId} not found`);
+  if (loan.status !== 'DISBURSED') throw new ConflictError(`Cannot repay a loan that is ${loan.status}`);
+  if (date < loan.disbursed_on) {
+    throw new ValidationError('effectiveDate cannot be before the disbursement date');
+  }
 
-  return withTransaction(pool, async (client) => {
-    // NOTE: Step 6 adds FOR UPDATE here to make parallel repayments safe.
-    const loan = (await client.query('SELECT * FROM loans WHERE id = $1', [loanId])).rows[0];
-    if (!loan) throw new NotFoundError(`Loan ${loanId} not found`);
-    if (loan.status !== 'DISBURSED') throw new ConflictError(`Cannot repay a loan that is ${loan.status}`);
-    if (date < loan.disbursed_on) {
-      throw new ValidationError('effectiveDate cannot be before the disbursement date');
+  const positions = await instalmentPositions(client, loanId);
+  const { lines: allocation, unallocatedPaise } = allocateRepayment(
+    amountPaise,
+    positions.map((p) => ({
+      instalmentId: p.instalmentId,
+      instalmentNo: p.instalmentNo,
+      dueDate: p.dueDate,
+      penaltyPaise: p.penaltyOutstandingPaise,
+      interestPaise: p.interestOutstandingPaise,
+      principalPaise: p.principalOutstandingPaise,
+    })),
+  );
+
+  const acct = await accountIds(client, loanId);
+  const accountFor = {
+    PENALTY: acct[LOAN_ACCOUNTS.PENALTY],
+    INTEREST: acct[LOAN_ACCOUNTS.INTEREST],
+    PRINCIPAL: acct[LOAN_ACCOUNTS.PRINCIPAL],
+  };
+
+  // Step 3 (D21): recognise any not-yet-accrued interest we are about to collect.
+  const byId = new Map(positions.map((p) => [p.instalmentId, p]));
+  const accrualLines = [];
+  let accrualTotal = 0;
+  for (const line of allocation.filter((l) => l.component === 'INTEREST')) {
+    const p = byId.get(line.instalmentId);
+    const notYetAccrued = p.interestDuePaise - p.interestAccruedPaise;
+    if (notYetAccrued > 0) {
+      accrualLines.push({ accountId: accountFor.INTEREST, direction: 'DEBIT', amountPaise: notYetAccrued, instalmentId: p.instalmentId });
+      accrualTotal += notYetAccrued;
     }
-
-    const positions = await instalmentPositions(client, loanId);
-    const { lines: allocation, unallocatedPaise } = allocateRepayment(
-      amountPaise,
-      positions.map((p) => ({
-        instalmentId: p.instalmentId,
-        instalmentNo: p.instalmentNo,
-        dueDate: p.dueDate,
-        penaltyPaise: p.penaltyOutstandingPaise,
-        interestPaise: p.interestOutstandingPaise,
-        principalPaise: p.principalOutstandingPaise,
-      })),
-    );
-
-    const acct = await accountIds(client, loanId);
-    const accountFor = {
-      PENALTY: acct[LOAN_ACCOUNTS.PENALTY],
-      INTEREST: acct[LOAN_ACCOUNTS.INTEREST],
-      PRINCIPAL: acct[LOAN_ACCOUNTS.PRINCIPAL],
-    };
-
-    // Step 3 (D21): recognise any not-yet-accrued interest we are about to collect.
-    const byId = new Map(positions.map((p) => [p.instalmentId, p]));
-    const accrualLines = [];
-    let accrualTotal = 0;
-    for (const line of allocation.filter((l) => l.component === 'INTEREST')) {
-      const p = byId.get(line.instalmentId);
-      const notYetAccrued = p.interestDuePaise - p.interestAccruedPaise;
-      if (notYetAccrued > 0) {
-        accrualLines.push({ accountId: accountFor.INTEREST, direction: 'DEBIT', amountPaise: notYetAccrued, instalmentId: p.instalmentId });
-        accrualTotal += notYetAccrued;
-      }
-    }
-    if (accrualTotal > 0) {
-      await postTransaction(client, {
-        loanId,
-        type: 'INTEREST_ACCRUAL',
-        effectiveDate: date,
-        createdBy: actorId,
-        memo: 'Interest recognised on repayment',
-        lines: [
-          ...accrualLines,
-          { accountId: acct[COMPANY_ACCOUNTS.INTEREST_INCOME], direction: 'CREDIT', amountPaise: accrualTotal },
-        ],
-      });
-    }
-
-    // Step 4: the repayment itself.
-    const repaymentLines = [
-      { accountId: acct[COMPANY_ACCOUNTS.BANK], direction: 'DEBIT', amountPaise },
-      ...allocation.map((l) => ({
-        accountId: accountFor[l.component], direction: 'CREDIT', amountPaise: l.amountPaise, instalmentId: l.instalmentId,
-      })),
-    ];
-    if (unallocatedPaise > 0) {
-      repaymentLines.push({ accountId: acct[COMPANY_ACCOUNTS.BORROWER_ADVANCE], direction: 'CREDIT', amountPaise: unallocatedPaise });
-    }
-    const posting = await postTransaction(client, {
+  }
+  if (accrualTotal > 0) {
+    await postTransaction(client, {
       loanId,
-      type: 'REPAYMENT',
+      type: 'INTEREST_ACCRUAL',
       effectiveDate: date,
       createdBy: actorId,
-      idempotencyKey,
-      externalEventId,
-      memo: 'Repayment',
-      lines: repaymentLines,
+      memo: 'Interest recognised on repayment',
+      lines: [
+        ...accrualLines,
+        { accountId: acct[COMPANY_ACCOUNTS.INTEREST_INCOME], direction: 'CREDIT', amountPaise: accrualTotal },
+      ],
     });
+  }
 
-    // Step 5: close the loan once nothing is owed.
-    const allocatedTo = (id, component) => allocation
-      .filter((l) => l.instalmentId === id && l.component === component)
-      .reduce((s, l) => s + l.amountPaise, 0);
-    const stillOwed = positions.reduce((sum, p) =>
-      sum
-      + (p.principalOutstandingPaise - allocatedTo(p.instalmentId, 'PRINCIPAL'))
-      + (p.interestOutstandingPaise - allocatedTo(p.instalmentId, 'INTEREST'))
-      + (p.penaltyOutstandingPaise - allocatedTo(p.instalmentId, 'PENALTY')), 0);
-
-    let status = loan.status;
-    if (stillOwed === 0) {
-      await client.query(`UPDATE loans SET status = 'CLOSED', closed_on = $2 WHERE id = $1`, [loanId, date]);
-      status = 'CLOSED';
-    }
-
-    return {
-      transactionId: posting.transactionId,
-      loanId,
-      amountPaise,
-      effectiveDate: date,
-      allocation,
-      advancePaise: unallocatedPaise,
-      loanStatus: status,
-      balances: await loanLedgerBalances(client, loanId),
-    };
+  // Step 4: the repayment itself. The idempotency key is also stored on the
+  // ledger transaction, whose UNIQUE constraint is a last safety net.
+  const repaymentLines = [
+    { accountId: acct[COMPANY_ACCOUNTS.BANK], direction: 'DEBIT', amountPaise },
+    ...allocation.map((l) => ({
+      accountId: accountFor[l.component], direction: 'CREDIT', amountPaise: l.amountPaise, instalmentId: l.instalmentId,
+    })),
+  ];
+  if (unallocatedPaise > 0) {
+    repaymentLines.push({ accountId: acct[COMPANY_ACCOUNTS.BORROWER_ADVANCE], direction: 'CREDIT', amountPaise: unallocatedPaise });
+  }
+  const posting = await postTransaction(client, {
+    loanId,
+    type: 'REPAYMENT',
+    effectiveDate: date,
+    createdBy: actorId,
+    idempotencyKey,
+    externalEventId,
+    memo: 'Repayment',
+    lines: repaymentLines,
   });
+
+  // Step 5: close the loan once nothing is owed.
+  const allocatedTo = (id, component) => allocation
+    .filter((l) => l.instalmentId === id && l.component === component)
+    .reduce((s, l) => s + l.amountPaise, 0);
+  const stillOwed = positions.reduce((sum, p) =>
+    sum
+    + (p.principalOutstandingPaise - allocatedTo(p.instalmentId, 'PRINCIPAL'))
+    + (p.interestOutstandingPaise - allocatedTo(p.instalmentId, 'INTEREST'))
+    + (p.penaltyOutstandingPaise - allocatedTo(p.instalmentId, 'PENALTY')), 0);
+
+  let status = loan.status;
+  if (stillOwed === 0) {
+    await client.query(`UPDATE loans SET status = 'CLOSED', closed_on = $2 WHERE id = $1`, [loanId, date]);
+    status = 'CLOSED';
+  }
+
+  return {
+    transactionId: posting.transactionId,
+    loanId,
+    amountPaise,
+    effectiveDate: date,
+    allocation,
+    advancePaise: unallocatedPaise,
+    loanStatus: status,
+    balances: await loanLedgerBalances(client, loanId),
+  };
 }
