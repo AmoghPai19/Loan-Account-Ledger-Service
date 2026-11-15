@@ -353,3 +353,9 @@ beyond the whole loan goes to BORROWER_ADVANCE.**
 - Late-arriving payments triggered Rs.3,754.98 of penalty reversals. All of it had already been paid, so it
   now sits in BORROWER_ADVANCE (owed back to borrowers), which matches D50 exactly.
 - Only 2 of 261 loans closed: the payment data runs to September, while most loans run longer.
+**D63. Replay runtime: about 1.5 minutes on Linux, about 61 minutes on Windows with Docker Desktop; identical results.**
+- Likely cause: each weekly accrual run opens one locked transaction per loan, even for loans with nothing due
+  (about 10,000 mostly empty transactions over the replay, plus 4,700 repayments), and committing is slow
+  when the database's disk sits inside Docker Desktop's virtual machine.
+- With more time: select only the loans that have something to accrue in one query before opening any
+  transactions, and measure commit latency to confirm the cause.

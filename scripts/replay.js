@@ -101,7 +101,13 @@ export async function runReplay(pool, dataset, { accrualEveryDays = 7, concurren
 
   let lastAccrualDay = dataset.loans.reduce((min, l) => (l.disbursedOn < min ? l.disbursedOn : min), '9999-12-31');
   const days = [...byDay.keys()].sort();
+  let lastMonth = '';
   for (const day of days) {
+    if (day.slice(0, 7) !== lastMonth) { // progress, once per simulated month
+      lastMonth = day.slice(0, 7);
+      const done = outcome.filter(Boolean).length;
+      log(`  ${day}: ${done} of ${dataset.events.length} events processed, ${Math.round((Date.now() - started) / 1000)} s so far`);
+    }
     if (daysBetween(lastAccrualDay, day) >= accrualEveryDays) {
       await accrue(addDays(day, -1)); // the nightly job, before this day's payments arrive
       lastAccrualDay = day;
