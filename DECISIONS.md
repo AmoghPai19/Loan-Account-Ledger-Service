@@ -143,3 +143,28 @@ beyond the whole loan goes to BORROWER_ADVANCE.**
 **D25. Disbursement locks the loan row (`SELECT ... FOR UPDATE`) before checking its status.**
 - Why: two simultaneous disburse requests could otherwise both see CREATED and both disburse.
   The same protection for repayments is deliberately left to Step 6, where a parallel test proves it is needed.
+
+## Step 4: REST API
+
+**D26. Express 5 for routing; routes are thin and call the service layer.**
+- Alternatives: plain `node:http` (no dependency, but hand-written URL and JSON parsing); Fastify.
+- Why: readable routes, and Express 5 forwards errors thrown in `async` handlers to the error handler
+  automatically, so routes need no try/catch. All business rules stay in `src/services` and are tested
+  without HTTP. `createApp()` is separate from `server.js`, so tests start the app on a random free port.
+
+**D27. Money crosses the API as integer paise, in fields ending in `Paise` (e.g. `amountPaise: 93333`).**
+- Alternative: decimal rupee strings ("933.33").
+- Why: identical to how it is stored, so there is no parsing or rounding at the boundary, and the field
+  name makes the unit impossible to miss. Clients format for display (`formatPaise` shows how).
+
+**D28. Every request (except /health) must send `X-API-Key`; the key's SHA-256 hash identifies the user.**
+- Missing or unknown key returns 401. The user becomes the actor on every row written.
+  Step 7 adds role checks (what each user may do) on top of this.
+
+**D29. One error format and one error handler: `{ "error": { "code", "message", "details" } }`.**
+- ValidationError -> 400, unknown key -> 401, NotFoundError -> 404, ConflictError -> 409, malformed JSON -> 400.
+- Unexpected errors are logged on the server and return a generic 500, never internal details.
+- A malformed id (not a UUID) returns 404 rather than reaching Postgres and causing a 500.
+
+**D30. The database uses snake_case; the API uses camelCase, converted at the edge (`toCamel`).**
+- Why: each side follows its own convention, and the conversion happens in one place.

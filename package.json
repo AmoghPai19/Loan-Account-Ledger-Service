@@ -8,13 +8,15 @@
   },
   "scripts": {
     "test": "node --test --test-concurrency=1",
-    "migrate": "node scripts/migrate.js"
+    "migrate": "node scripts/migrate.js",
+    "start": "node src/server.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "decimal.js": "10.4.3",
+    "express": "5.1.0",
     "pg": "8.13.1"
   },
   "type": "module",
