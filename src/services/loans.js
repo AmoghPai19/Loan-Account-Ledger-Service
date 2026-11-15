@@ -3,8 +3,10 @@
 //
 // Every operation that writes runs inside ONE database transaction
 // (withTransaction), so it either fully happens or doesn't happen at all.
-// `actorId` is the user doing it; it is stored on every row (and used for
-// the audit trail in Step 7).
+// `actorId` is the user doing it; it is stored on every row.
+//
+// Step 7 (D44): every change also writes an audit_log row INSIDE the same
+// transaction. `meta.requestId` links that row to the HTTP request.
 // =====================================================================
 import { withTransaction } from '../db/tx.js';
 import { ValidationError, NotFoundError, ConflictError } from '../errors.js';
@@ -12,6 +14,7 @@ import { assertIsoDate } from '../domain/dates.js';
 import { buildSchedule, firstDueDateFor } from '../domain/schedule.js';
 import { allocateRepayment } from '../domain/allocation.js';
 import { requireIdempotencyKey, requestHash, claimKey, completeKey } from './idempotency.js';
+import { recordAudit } from '../audit/audit.js';
 import {
   LOAN_ACCOUNTS, COMPANY_ACCOUNTS, createLoanAccounts, accountIds,
   postTransaction, loanLedgerBalances,
@@ -44,16 +47,22 @@ const UNIQUE_VIOLATION = '23505'; // Postgres error code
 
 // ---------- borrowers -----------------------------------------------------
 
-export async function createBorrower(pool, { externalRef, fullName, phone = null }, actorId) {
+export async function createBorrower(pool, { externalRef, fullName, phone = null }, actorId, meta = {}) {
   const ref = requireText(externalRef, 'externalRef');
   const name = requireText(fullName, 'fullName');
   try {
-    const { rows } = await pool.query(
-      `INSERT INTO borrowers (external_ref, full_name, phone, created_by)
-       VALUES ($1, $2, $3, $4) RETURNING *`,
-      [ref, name, phone, actorId],
-    );
-    return rows[0];
+    return await withTransaction(pool, async (client) => {
+      const borrower = (await client.query(
+        `INSERT INTO borrowers (external_ref, full_name, phone, created_by)
+         VALUES ($1, $2, $3, $4) RETURNING *`,
+        [ref, name, phone, actorId],
+      )).rows[0];
+      await recordAudit(client, {
+        actorId, action: 'BORROWER_CREATED', entityType: 'borrower', entityId: borrower.id,
+        after: borrower, requestId: meta.requestId,
+      });
+      return borrower;
+    });
   } catch (err) {
     if (err.code === UNIQUE_VIOLATION) throw new ConflictError(`Borrower ${ref} already exists`);
     throw err;
@@ -62,7 +71,7 @@ export async function createBorrower(pool, { externalRef, fullName, phone = null
 
 // ---------- loans -----------------------------------------------------------
 
-export async function createLoan(pool, { borrowerId, productCode, principalPaise, tenure }, actorId) {
+export async function createLoan(pool, { borrowerId, productCode, principalPaise, tenure }, actorId, meta = {}) {
   requirePositivePaise(principalPaise, 'principalPaise');
   if (!Number.isInteger(tenure) || tenure <= 0) {
     throw new ValidationError('tenure must be a positive whole number of instalments');
@@ -97,6 +106,10 @@ export async function createLoan(pool, { borrowerId, productCode, principalPaise
     )).rows[0];
 
     await createLoanAccounts(client, loan.id);
+    await recordAudit(client, {
+      actorId, action: 'LOAN_CREATED', entityType: 'loan', entityId: loan.id,
+      after: loan, requestId: meta.requestId,
+    });
     return loan;
   });
 }
@@ -111,7 +124,7 @@ export async function getLoan(db, loanId) {
  * Disburse: build and store the schedule, mark the loan DISBURSED, and post
  *   Dr PRINCIPAL_RECEIVABLE (loan) / Cr BANK.
  */
-export async function disburseLoan(pool, { loanId, disbursedOn }, actorId) {
+export async function disburseLoan(pool, { loanId, disbursedOn }, actorId, meta = {}) {
   const date = requireDate(disbursedOn, 'disbursedOn');
 
   return withTransaction(pool, async (client) => {
@@ -160,6 +173,12 @@ export async function disburseLoan(pool, { loanId, disbursedOn }, actorId) {
         { accountId: acct[LOAN_ACCOUNTS.PRINCIPAL], direction: 'DEBIT', amountPaise: loan.principal_paise },
         { accountId: acct[COMPANY_ACCOUNTS.BANK], direction: 'CREDIT', amountPaise: loan.principal_paise },
       ],
+    });
+
+    await recordAudit(client, {
+      actorId, action: 'LOAN_DISBURSED', entityType: 'loan', entityId: loanId,
+      before: loan, after: { ...updated, transactionId: posting.transactionId, instalments: schedule.length },
+      requestId: meta.requestId,
     });
 
     return { loan: updated, transactionId: posting.transactionId, schedule };
@@ -228,7 +247,7 @@ export async function getSchedule(db, loanId) {
  */
 export async function postRepayment(pool, {
   loanId, amountPaise, effectiveDate, idempotencyKey = null, externalEventId = null,
-}, actorId) {
+}, actorId, meta = {}) {
   requirePositivePaise(amountPaise, 'amountPaise');
   const date = requireDate(effectiveDate, 'effectiveDate');
   if (idempotencyKey !== null) requireIdempotencyKey(idempotencyKey);
@@ -240,11 +259,12 @@ export async function postRepayment(pool, {
         userId: actorId,
         hash: requestHash(['repayment', loanId, amountPaise, date, externalEventId ?? null]),
       });
+      // A replay changes nothing, so it writes no audit row (D45).
       if (!claim.claimed) return { ...claim.responseBody, replayed: true };
     }
 
     const result = await applyRepayment(client, {
-      loanId, amountPaise, date, idempotencyKey, externalEventId, actorId,
+      loanId, amountPaise, date, idempotencyKey, externalEventId, actorId, requestId: meta.requestId ?? null,
     });
 
     if (idempotencyKey !== null) {
@@ -265,7 +285,7 @@ export async function postRepayment(pool, {
  *    Cr BORROWER_ADVANCE for anything left over.
  * 5. Close the loan if nothing is owed any more.
  */
-async function applyRepayment(client, { loanId, amountPaise, date, idempotencyKey, externalEventId, actorId }) {
+async function applyRepayment(client, { loanId, amountPaise, date, idempotencyKey, externalEventId, actorId, requestId = null }) {
   // Step 6 (D37): FOR UPDATE locks this loan row until COMMIT, so a second repayment waits here.
   const loan = (await client.query('SELECT * FROM loans WHERE id = $1 FOR UPDATE', [loanId])).rows[0];
   if (!loan) throw new NotFoundError(`Loan ${loanId} not found`);
@@ -352,10 +372,22 @@ async function applyRepayment(client, { loanId, amountPaise, date, idempotencyKe
     + (p.interestOutstandingPaise - allocatedTo(p.instalmentId, 'INTEREST'))
     + (p.penaltyOutstandingPaise - allocatedTo(p.instalmentId, 'PENALTY')), 0);
 
+  await recordAudit(client, {
+    actorId, action: 'REPAYMENT_POSTED', entityType: 'loan', entityId: loanId, requestId,
+    after: {
+      transactionId: posting.transactionId, amountPaise, effectiveDate: date,
+      allocation, advancePaise: unallocatedPaise, idempotencyKey, externalEventId,
+    },
+  });
+
   let status = loan.status;
   if (stillOwed === 0) {
     await client.query(`UPDATE loans SET status = 'CLOSED', closed_on = $2 WHERE id = $1`, [loanId, date]);
     status = 'CLOSED';
+    await recordAudit(client, {
+      actorId, action: 'LOAN_CLOSED', entityType: 'loan', entityId: loanId, requestId,
+      before: { status: loan.status }, after: { status: 'CLOSED', closedOn: date },
+    });
   }
 
   return {

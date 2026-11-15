@@ -231,3 +231,39 @@ beyond the whole loan goes to BORROWER_ADVANCE.**
 **D40. Status checks happen under the lock.**
 - When parallel payments overpay a loan, exactly one of them closes it; the rest see CLOSED and are refused
   with 409, posting nothing. Accepted money minus the borrower advance equals exactly what was owed.
+
+## Step 7: Roles and audit trail
+
+**D41. Permissions live in one table (`src/http/authorize.js`); every route declares the permission it needs.**
+- A caller whose role lacks it gets 403 FORBIDDEN, before any business logic runs.
+- Alternatives: role checks scattered through routes or services.
+- Why: one place to read and review the whole policy. The table is unit-tested, and an HTTP test calls
+  every endpoint with every role (10 endpoints x 3 roles) to check the routes really use it.
+
+**D42. Maker-checker: officers create loans, but only managers can disburse.**
+- Why: disbursement is when money leaves the bank, so one person alone can't create and pay out a fake loan.
+- With more time: also stop a manager disbursing a loan they created themselves.
+
+**D43. Auditors are strictly read-only; officers can't see the company-wide trial balance or the audit trail.**
+
+**D44. Every change writes an audit row INSIDE the same database transaction as the change.**
+- Rows record the actor, action, entity, time, and a JSON snapshot of before and after.
+- Actions: BORROWER_CREATED, LOAN_CREATED, LOAN_DISBURSED, REPAYMENT_POSTED, LOAN_CLOSED.
+- Repayments and closure are filed under the loan, so a loan's complete history is one query:
+  `GET /audit?entityType=loan&entityId=<id>`.
+- Why the same transaction: there can never be a change without its audit row, or an audit row for a
+  change that was rolled back. The table is append-only (trigger from Step 1), and a test proves that
+  UPDATE and DELETE are rejected even directly in the database.
+
+**D45. Only real changes are audited.**
+- Idempotent replays, failed requests and forbidden requests change nothing, so they write no audit row.
+- With more time: a separate security log of denied (403) attempts.
+
+**D46. Every request gets an id (`X-Request-Id`): taken from the caller if sensible, otherwise generated.**
+- It is returned on every response and stored on every audit row the request causes, so a support
+  ticket quoting a request id leads straight to the exact changes it made.
+
+**D47. Authorisation is enforced at the API boundary; services trust their callers.**
+- Internal callers (the accrual job, the replay) call services directly as the `system` user.
+- Trade-off: a new entry point must remember to check permissions. With more time: pass the user's role
+  into the services and check there too (defence in depth).

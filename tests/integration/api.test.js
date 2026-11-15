@@ -65,7 +65,7 @@ describe('REST API', () => {
     const loanId = l.body.id;
 
     // disburse
-    const d = await call('POST', `/loans/${loanId}/disburse`, { body: { disbursedOn: '2026-01-01' } });
+    const d = await call('POST', `/loans/${loanId}/disburse`, { body: { disbursedOn: '2026-01-01' }, key: 'dev-manager-key' });
     assert.equal(d.status, 200);
     assert.equal(d.body.loan.status, 'DISBURSED');
     assert.equal(d.body.instalments, 12);
@@ -100,7 +100,7 @@ describe('REST API', () => {
     assert.equal(g.body.balances.principalReceivablePaise, 1_000_000 - 83_333);
 
     // ledger still balances
-    const tb = await call('GET', '/ledger/trial-balance');
+    const tb = await call('GET', '/ledger/trial-balance', { key: 'dev-manager-key' });
     assert.equal(tb.body.balanced, true);
   });
 

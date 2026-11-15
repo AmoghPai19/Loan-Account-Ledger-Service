@@ -32,7 +32,7 @@ describe('parallel repayments on one loan', () => {
   async function newLoan(ref) {
     const b = await call('POST', '/borrowers', { externalRef: ref, fullName: 'Parallel Test' });
     const l = await call('POST', '/loans', { borrowerId: b.body.id, productCode: 'EMI', principalPaise: 10_000_000, tenure: 12 });
-    await call('POST', `/loans/${l.body.id}/disburse`, { disbursedOn: '2026-01-15' });
+    await call('POST', `/loans/${l.body.id}/disburse`, { disbursedOn: '2026-01-15' }, { 'X-API-Key': 'dev-manager-key' });
     return l.body.id;
   }
 
